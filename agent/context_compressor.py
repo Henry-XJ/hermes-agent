@@ -31,7 +31,6 @@ from agent.model_metadata import (
     get_model_context_length,
     estimate_messages_tokens_rough,
 )
-from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
@@ -62,93 +61,6 @@ _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 # Chars per token rough estimate
 _CHARS_PER_TOKEN = 4
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
-
-
-def _content_text_for_contains(content: Any) -> str:
-    """Return a best-effort text view of message content.
-
-    Used only for substring checks when we need to know whether we've already
-    appended a note to a message. Keeps multimodal lists intact elsewhere.
-    """
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                text = item.get("text")
-                if isinstance(text, str):
-                    parts.append(text)
-        return "\n".join(part for part in parts if part)
-    return str(content)
-
-
-def _append_text_to_content(content: Any, text: str, *, prepend: bool = False) -> Any:
-    """Append or prepend plain text to message content safely.
-
-    Compression sometimes needs to add a note or merge a summary into an
-    existing message. Message content may be plain text or a multimodal list of
-    blocks, so direct string concatenation is not always safe.
-    """
-    if content is None:
-        return text
-    if isinstance(content, str):
-        return text + content if prepend else content + text
-    if isinstance(content, list):
-        text_block = {"type": "text", "text": text}
-        return [text_block, *content] if prepend else [*content, text_block]
-    rendered = str(content)
-    return text + rendered if prepend else rendered + text
-
-
-def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
-    """Shrink long string values inside a tool-call arguments JSON blob while
-    preserving JSON validity.
-
-    The ``function.arguments`` field on a tool call is a JSON-encoded string
-    passed through to the LLM provider; downstream providers strictly
-    validate it and return a non-retryable 400 when it is not well-formed.
-    An earlier implementation sliced the raw JSON at a fixed byte offset and
-    appended ``...[truncated]`` — which routinely produced strings like::
-
-        {"path": "/foo/bar", "content": "# long markdown
-        ...[truncated]
-
-    i.e. an unterminated string and a missing closing brace. MiniMax, for
-    example, rejects this with ``invalid function arguments json string``
-    and the session gets stuck re-sending the same broken history on every
-    turn. See issue #11762 for the observed loop.
-
-    This helper parses the arguments, shrinks long string leaves inside the
-    parsed structure, and re-serialises. Non-string values (paths, ints,
-    booleans) are preserved intact. If the arguments are not valid JSON
-    to begin with — some model backends use non-JSON tool arguments — the
-    original string is returned unchanged rather than replaced with
-    something neither we nor the backend can parse.
-    """
-    try:
-        parsed = json.loads(args)
-    except (ValueError, TypeError):
-        return args
-
-    def _shrink(obj: Any) -> Any:
-        if isinstance(obj, str):
-            if len(obj) > head_chars:
-                return obj[:head_chars] + "...[truncated]"
-            return obj
-        if isinstance(obj, dict):
-            return {k: _shrink(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [_shrink(v) for v in obj]
-        return obj
-
-    shrunken = _shrink(parsed)
-    # ensure_ascii=False preserves CJK/emoji instead of bloating with \uXXXX
-    return json.dumps(shrunken, ensure_ascii=False)
 
 
 def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) -> str:
@@ -537,11 +449,6 @@ class ContextCompressor(ContextEngine):
         # Pass 3: Truncate large tool_call arguments in assistant messages
         # outside the protected tail. write_file with 50KB content, for
         # example, survives pruning entirely without this.
-        #
-        # The shrinking is done inside the parsed JSON structure so the
-        # result remains valid JSON — otherwise downstream providers 400
-        # on every subsequent turn until the broken call falls out of
-        # the window. See ``_truncate_tool_call_args_json`` docstring.
         for i in range(prune_boundary):
             msg = result[i]
             if msg.get("role") != "assistant" or not msg.get("tool_calls"):
@@ -551,10 +458,25 @@ class ContextCompressor(ContextEngine):
             for tc in msg["tool_calls"]:
                 if isinstance(tc, dict):
                     args = tc.get("function", {}).get("arguments", "")
-                    if len(args) > 500:
-                        new_args = _truncate_tool_call_args_json(args)
-                        if new_args != args:
-                            tc = {**tc, "function": {**tc["function"], "arguments": new_args}}
+                    if isinstance(args, str) and len(args) > 500:
+                        # Try to parse as JSON and truncate intelligently
+                        try:
+                            args_obj = json.loads(args)
+                            if isinstance(args_obj, dict):
+                                # Truncate string fields, preserve structure
+                                for k, v in args_obj.items():
+                                    if isinstance(v, str) and len(v) > 200:
+                                        args_obj[k] = v[:200] + "...[truncated]"
+                                new_args = json.dumps(args_obj, ensure_ascii=False)
+                                tc = {**tc, "function": {**tc["function"], "arguments": new_args}}
+                                modified = True
+                            else:
+                                # Not a dict JSON, just truncate with marker
+                                tc = {**tc, "function": {**tc["function"], "arguments": args[:500] + "...[truncated]"}}
+                                modified = True
+                        except (json.JSONDecodeError, TypeError):
+                            # Not valid JSON, truncate with marker but preserve as much as possible
+                            tc = {**tc, "function": {**tc["function"], "arguments": args[:500] + "...[truncated]"}}
                             modified = True
                 new_tcs.append(tc)
             if modified:
@@ -592,15 +514,11 @@ class ContextCompressor(ContextEngine):
         Includes tool call arguments and result content (up to
         ``_CONTENT_MAX`` chars per message) so the summarizer can preserve
         specific details like file paths, commands, and outputs.
-
-        All content is redacted before serialization to prevent secrets
-        (API keys, tokens, passwords) from leaking into the summary that
-        gets sent to the auxiliary model and persisted across compactions.
         """
         parts = []
         for msg in turns:
             role = msg.get("role", "unknown")
-            content = redact_sensitive_text(msg.get("content") or "")
+            content = msg.get("content") or ""
 
             # Tool results: keep enough content for the summarizer
             if role == "tool":
@@ -621,7 +539,7 @@ class ContextCompressor(ContextEngine):
                         if isinstance(tc, dict):
                             fn = tc.get("function", {})
                             name = fn.get("name", "?")
-                            args = redact_sensitive_text(fn.get("arguments", ""))
+                            args = fn.get("arguments", "")
                             # Truncate long arguments but keep enough for context
                             if len(args) > self._TOOL_ARGS_MAX:
                                 args = args[:self._TOOL_ARGS_HEAD] + "..."
@@ -679,13 +597,7 @@ class ContextCompressor(ContextEngine):
             "assistant that continues the conversation. "
             "Do NOT respond to any questions or requests in the conversation — "
             "only output the structured summary. "
-            "Do NOT include any preamble, greeting, or prefix. "
-            "Write the summary in the same language the user was using in the "
-            "conversation — do not translate or switch to English. "
-            "NEVER include API keys, tokens, passwords, secrets, credentials, "
-            "or connection strings in the summary — replace any that appear "
-            "with [REDACTED]. Note that the user had credentials present, but "
-            "do not preserve their values."
+            "Do NOT include any preamble, greeting, or prefix."
         )
 
         # Shared structured template (used by both paths).
@@ -742,7 +654,7 @@ Be specific with file paths, commands, line numbers, and results.]
 [What remains to be done — framed as context, not instructions]
 
 ## Critical Context
-[Any specific values, error messages, configuration details, or data that would be lost without explicit preservation. NEVER include API keys, tokens, passwords, or credentials — write [REDACTED] instead.]
+[Any specific values, error messages, configuration details, or data that would be lost without explicit preservation]
 
 Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
 
@@ -782,7 +694,7 @@ Use this exact structure:
             prompt += f"""
 
 FOCUS TOPIC: "{focus_topic}"
-The user has requested that this compaction PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget. Even for the focus topic, NEVER preserve API keys, tokens, passwords, or credentials — use [REDACTED]."""
+The user has requested that this compaction PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget."""
 
         try:
             call_kwargs = {
@@ -805,9 +717,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             # Handle cases where content is not a string (e.g., dict from llama.cpp)
             if not isinstance(content, str):
                 content = str(content) if content else ""
-            # Redact the summary output as well — the summarizer LLM may
-            # ignore prompt instructions and echo back secrets verbatim.
-            summary = redact_sensitive_text(content.strip())
+            summary = content.strip()
             # Store for iterative updates on next compaction
             self._previous_summary = summary
             self._summary_failure_cooldown_until = 0.0
@@ -848,7 +758,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 )
                 self.summary_model = ""  # empty = use main model
                 self._summary_failure_cooldown_until = 0.0  # no cooldown
-                return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)  # retry immediately
+                return self._generate_summary(messages, summary_budget)  # retry immediately
 
             # Transient errors (timeout, rate limit, network) — shorter cooldown
             _transient_cooldown = 60
@@ -1185,13 +1095,10 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         for i in range(compress_start):
             msg = messages[i].copy()
             if i == 0 and msg.get("role") == "system":
-                existing = msg.get("content")
+                existing = msg.get("content") or ""
                 _compression_note = "[Note: Some earlier conversation turns have been compacted into a handoff summary to preserve context space. The current session state may still reflect earlier work, so build on that summary and state rather than re-doing work.]"
-                if _compression_note not in _content_text_for_contains(existing):
-                    msg["content"] = _append_text_to_content(
-                        existing,
-                        "\n\n" + _compression_note if isinstance(existing, str) and existing else _compression_note,
-                    )
+                if _compression_note not in existing:
+                    msg["content"] = existing + "\n\n" + _compression_note
             compressed.append(msg)
 
         # If LLM summary failed, insert a static fallback so the model
@@ -1235,15 +1142,12 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         for i in range(compress_end, n_messages):
             msg = messages[i].copy()
             if _merge_summary_into_tail and i == compress_end:
-                merged_prefix = (
+                original = msg.get("content") or ""
+                msg["content"] = (
                     summary
                     + "\n\n--- END OF CONTEXT SUMMARY — "
                     "respond to the message below, not the summary above ---\n\n"
-                )
-                msg["content"] = _append_text_to_content(
-                    msg.get("content"),
-                    merged_prefix,
-                    prepend=True,
+                    + original
                 )
                 _merge_summary_into_tail = False
             compressed.append(msg)
